@@ -1,15 +1,41 @@
 /**
  * Thin client for Rubric Protocol's x402-paid attested-price routes.
- * Handles the 402 -> sign EIP-3009 USDC authorization -> retry flow via
- * Coinbase's official x402-fetch, so callers just get back JSON.
+ *
+ * Rubric's server-side verifier is hand-rolled (see x402-services-endpoint.ts
+ * gate(), "no SDK"), not the reference x402 facilitator wire format: it wants
+ * the buyer's payment payload as `{x402Version, accepted: {...CAIP-2 network,
+ * amount, payTo...}, payload: {signature, authorization}}`, whereas the
+ * official `x402-fetch`/`x402/client` helpers build and validate the
+ * standard `{x402Version, scheme, network: "base", payload}` shape (short
+ * chain names, no `accepted` wrapper). Neither `wrapFetchWithPayment` nor
+ * `createPaymentHeader` can produce what Rubric expects, so this parses the
+ * 402 itself and calls the two lower-level `x402/client` primitives that
+ * *do* still fit — `preparePaymentHeader` (builds the unsigned EIP-3009
+ * authorization) and `signPaymentHeader` (the actual signTypedData call) —
+ * then wraps the result in Rubric's envelope by hand. The cryptographic
+ * signing is still the audited x402 SDK code; only the envelope shape is
+ * custom.
  */
 import { createWalletClient, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
-import { wrapFetchWithPayment } from "x402-fetch";
+import { preparePaymentHeader, signPaymentHeader } from "x402/client";
+import type { PaymentRequirements } from "x402/types";
 
 const RUBRIC_BASE_URL = "https://rubric-protocol.com";
 const CALL_TIMEOUT_MS = 30_000;
+
+// Rubric only prices in USDC on Base mainnet today; mapping is kept explicit
+// (rather than a generic CAIP-2 parser) so an unrecognized chain fails loudly
+// instead of silently signing against the wrong network.
+const CAIP2_TO_X402_NETWORK: Record<string, string> = {
+  "eip155:8453": "base",
+  "eip155:84532": "base-sepolia",
+};
+
+// Safety ceiling against a misbehaving server, not an expected spend — every
+// route here prices $0.02-$0.50.
+const MAX_ATOMIC_UNITS = 1_000_000n; // 1 USDC
 
 export interface RubricCallResult {
   ok: boolean;
@@ -19,14 +45,7 @@ export interface RubricCallResult {
   error?: string;
 }
 
-type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
-
-let cachedFetcher: FetchLike | null = null;
-
-/** Lazily builds the payment-wrapped fetch. Fails loudly if no payer key is configured. */
-function paymentFetcher(): FetchLike {
-  if (cachedFetcher) return cachedFetcher;
-
+function payerAccount() {
   const privateKey = process.env.RUBRIC_MCP_PAYER_KEY;
   if (!privateKey || !privateKey.startsWith("0x") || privateKey.length !== 66) {
     throw new Error(
@@ -35,40 +54,133 @@ function paymentFetcher(): FetchLike {
         "(see tool descriptions for cost). Configure it in your MCP client's env block.",
     );
   }
+  return privateKeyToAccount(privateKey as `0x${string}`);
+}
 
-  const account = privateKeyToAccount(privateKey as `0x${string}`);
-  const walletClient = createWalletClient({ account, chain: base, transport: http() });
+/** Picks the "exact" EVM accept-entry Rubric offers. */
+function pickAcceptEntry(body: any): any {
+  const accepts: any[] = body?.accepts ?? [];
+  const entry = accepts.find(
+    (a) => a.scheme === "exact" && CAIP2_TO_X402_NETWORK[a.network] !== undefined,
+  );
+  if (!entry) {
+    throw new Error(
+      `No supported "exact"-scheme EVM accept entry in 402 response. Networks offered: ${accepts.map((a) => a.network).join(", ")}`,
+    );
+  }
+  return entry;
+}
 
-  // 1 USDC (6 decimals) is far above any route's price ($0.02-$0.50); this is a safety
-  // ceiling against a misbehaving server, not an expected spend.
-  const maxAtomicUnits = 1_000_000n;
-  cachedFetcher = wrapFetchWithPayment(fetch, walletClient as any, maxAtomicUnits) as FetchLike;
-  return cachedFetcher;
+/** x402/client's signing helpers key off the short chain name, not Rubric's CAIP-2 one. */
+function signingRequirements(entry: any): PaymentRequirements {
+  return {
+    scheme: "exact",
+    network: CAIP2_TO_X402_NETWORK[entry.network] as PaymentRequirements["network"],
+    maxAmountRequired: entry.amount,
+    resource: RUBRIC_BASE_URL,
+    description: "",
+    mimeType: "application/json",
+    payTo: entry.payTo,
+    maxTimeoutSeconds: entry.maxTimeoutSeconds,
+    asset: entry.asset,
+    extra: entry.extra,
+  };
 }
 
 async function callPaid(path: string): Promise<RubricCallResult> {
   const url = RUBRIC_BASE_URL + path;
-  let fetcher: FetchLike;
+
+  let account;
   try {
-    fetcher = paymentFetcher();
+    account = payerAccount();
   } catch (e) {
     return { ok: false, status: 0, paid: false, body: null, error: (e as Error).message };
   }
+  const walletClient = createWalletClient({ account, chain: base, transport: http() });
 
-  let res: Response;
+  let firstRes: Response;
   try {
-    res = await fetcher(url, { method: "GET", signal: AbortSignal.timeout(CALL_TIMEOUT_MS) });
+    firstRes = await fetch(url, { signal: AbortSignal.timeout(CALL_TIMEOUT_MS) });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { ok: false, status: 0, paid: false, body: null, error: `Request to ${url} failed: ${msg}` };
+  }
+
+  if (firstRes.status !== 402) {
+    return await toResult(firstRes);
+  }
+
+  const challenge = await firstRes.json();
+  let entry: any;
+  try {
+    entry = pickAcceptEntry(challenge);
+  } catch (e) {
+    return { ok: false, status: 402, paid: false, body: challenge, error: (e as Error).message };
+  }
+
+  if (BigInt(entry.amount) > MAX_ATOMIC_UNITS) {
+    return {
+      ok: false,
+      status: 402,
+      paid: false,
+      body: challenge,
+      error: `Price ${entry.amount} atomic units exceeds this client's safety ceiling (${MAX_ATOMIC_UNITS}).`,
+    };
+  }
+
+  const requirements = signingRequirements(entry);
+  let paymentB64: string;
+  try {
+    const unsigned = preparePaymentHeader(account.address, challenge.x402Version, requirements);
+    // The public signPaymentHeader signs AND base64-encodes into the standard
+    // x402 envelope; decode it back to get at the signed {signature, authorization}
+    // payload, which is the part Rubric's own envelope also needs verbatim.
+    const standardEnvelopeB64 = await signPaymentHeader(walletClient as any, requirements, unsigned);
+    const standardEnvelope = JSON.parse(Buffer.from(standardEnvelopeB64, "base64").toString("utf8"));
+
+    // Rubric's hand-rolled verifier (gate() in x402-services-endpoint.ts) reads
+    // pp.accepted.{scheme,network} and pp.payload.{signature,authorization} —
+    // its own envelope, not the standard x402 PaymentPayload shape.
+    const rubricPayload = {
+      x402Version: challenge.x402Version,
+      accepted: {
+        scheme: entry.scheme,
+        network: entry.network, // CAIP-2, e.g. "eip155:8453" — as Rubric sent it
+        asset: entry.asset,
+        payTo: entry.payTo,
+        amount: entry.amount,
+        maxTimeoutSeconds: entry.maxTimeoutSeconds,
+        extra: entry.extra,
+      },
+      payload: standardEnvelope.payload,
+    };
+    paymentB64 = Buffer.from(JSON.stringify(rubricPayload)).toString("base64");
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return {
       ok: false,
-      status: 0,
+      status: 402,
       paid: false,
-      body: null,
-      error: `Request to ${url} failed: ${msg}. Common causes: insufficient USDC on Base mainnet in the payer wallet, or the symbol is unsupported.`,
+      body: challenge,
+      error: `Failed to sign payment authorization: ${msg}. Common cause: insufficient USDC on Base mainnet in wallet ${account.address}.`,
     };
   }
 
+  let secondRes: Response;
+  try {
+    secondRes = await fetch(url, {
+      headers: { "X-PAYMENT": paymentB64 },
+      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { ok: false, status: 0, paid: false, body: null, error: `Paid retry to ${url} failed: ${msg}` };
+  }
+
+  return await toResult(secondRes);
+}
+
+async function toResult(res: Response): Promise<RubricCallResult> {
   const text = await res.text();
   let body: unknown = text;
   try {
@@ -77,12 +189,20 @@ async function callPaid(path: string): Promise<RubricCallResult> {
     /* not JSON, keep raw text */
   }
 
-  return {
-    ok: res.ok,
-    status: res.status,
-    paid: Boolean(res.headers.get("x-payment-response")),
-    body,
-  };
+  // Rubric's own header, not the standard x402 X-PAYMENT-RESPONSE: base64 JSON
+  // {success, transaction, network, payer} (see x402-services-endpoint.ts __settle).
+  const paymentResponseHeader = res.headers.get("payment-response");
+  let paid = false;
+  if (paymentResponseHeader) {
+    try {
+      const decoded = JSON.parse(Buffer.from(paymentResponseHeader, "base64").toString("utf8"));
+      paid = decoded?.success === true;
+    } catch {
+      paid = false;
+    }
+  }
+
+  return { ok: res.ok, status: res.status, paid, body };
 }
 
 /** GET /v1/x402/attested-price/:symbol[/proof|/at/:timestamp] */
